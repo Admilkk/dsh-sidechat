@@ -16,7 +16,7 @@ const result = await build({
   } }],
 });
 const client = await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
-const { attachContextDraft, removeContextDraft, serializeContext, decodeContext, completedMessages, findSentContext, callSidechat, inheritedTurnIds } = client;
+const { attachContextDraft, removeContextDraft, serializeContext, decodeContext, completedMessages, findSentContext, callSidechat, inheritedTurnIds, createSidechatState, createTranscriptProjection } = client;
 const quote = { kind: 'quote', id: 'quote-fixture', text: '第一行\n第二行 <b>仅为文字</b>', sourceSessionId: 'parent', label: '设计说明' };
 
 test('Remote call uses the real gateway args envelope and unwraps results and failures', async () => {
@@ -105,4 +105,94 @@ test('inherited context folding targets only real inherited turns and never a ch
     event(11, 'turn/end', { turn: 2, reason: { kind: 'forked' } }), event(12, 'turn/start', { turn: 3 })];
   assert.deepEqual(inheritedTurnIds(entries, { boundary: { inheritedMaxSeq: 10 } }), [1, 2]);
   assert.deepEqual(inheritedTurnIds(entries, { createdAt: 1011 }), [1, 2]);
+});
+
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+};
+
+test('a delayed refresh cannot resurrect a discarded side or normalize its stale summary', async () => {
+  const store = createSidechatState();
+  const response = deferred();
+  let normalized = 0;
+  const pending = store.refresh('parent', () => response.promise, value => { normalized++; return value; });
+  await Promise.resolve();
+  store.set('parent', { records: [], selected: null, loading: false });
+  response.resolve([{ id: 'discarded', sessionId: 'old-side' }]);
+  assert.deepEqual(await pending, []);
+  assert.deepEqual(store.get('parent').records, []);
+  assert.equal(normalized, 0);
+});
+
+test('concurrent refreshes share work and obsolete completion cannot remove a newer request', async () => {
+  const store = createSidechatState();
+  const old = deferred(), current = deferred();
+  let calls = 0;
+  const load = () => { calls++; return current.promise; };
+  const stale = store.refresh('parent', () => old.promise, value => value);
+  await Promise.resolve();
+  store.set('parent', { records: [], selected: null });
+  const fresh = store.refresh('parent', load, value => value);
+  assert.equal(store.refresh('parent', load, value => value), fresh);
+  old.resolve([{ id: 'old' }]);
+  await stale;
+  assert.equal(store.refresh('parent', load, value => value), fresh);
+  current.resolve([{ id: 'new', sessionId: 'new-side' }]);
+  await fresh;
+  assert.equal(calls, 1);
+  assert.equal(store.get('parent').selected, 'new');
+});
+
+test('obsolete network failures do not replace newer state; current failures remain retryable', async () => {
+  const store = createSidechatState();
+  const response = deferred();
+  const pending = store.refresh('parent', () => response.promise, value => value);
+  await Promise.resolve();
+  store.set('parent', { records: [{ id: 'new' }], error: null, loading: false });
+  response.reject(new Error('old network error'));
+  assert.deepEqual(await pending, [{ id: 'new' }]);
+  assert.equal(store.get('parent').error, null);
+  await assert.rejects(store.refresh('parent', () => Promise.reject(new Error('current failure')), value => value), /current failure/);
+  assert.equal(store.get('parent').loading, false);
+  assert.equal(store.get('parent').error, 'current failure');
+  await store.refresh('parent', () => [], value => value);
+  assert.equal(store.get('parent').error, null);
+});
+
+test('unloading suppresses pending admissions and queued network work', async () => {
+  const store = createSidechatState();
+  const response = deferred();
+  let normalized = 0, calls = 0, notices = 0;
+  store.subscribe(() => notices++);
+  const pending = store.refresh('parent', () => response.promise, value => { normalized++; return value; });
+  await Promise.resolve();
+  store.dispose();
+  const before = notices;
+  response.resolve([{ id: 'late' }]);
+  await pending;
+  await store.refresh('parent', () => { calls++; return []; }, value => value);
+  store.set('parent', { records: [{ id: 'ignored' }] });
+  assert.equal(normalized, 0);
+  assert.equal(calls, 0);
+  assert.equal(notices, before);
+  assert.deepEqual(store.get('parent').records, []);
+});
+
+test('reply actions share one transcript projection and invalidate it on history or fork-boundary changes', () => {
+  const project = createTranscriptProjection();
+  const source = {}, other = {};
+  const record = { sessionId: 'child', boundary: { inheritedMaxSeq: 1 } };
+  const entries = [user(2, 'u', '问题'), assistant(3, 'a', '答案'), event(4, 'turn/end', { reason: { kind: 'completed' } })];
+  const first = project(source, entries, record);
+  assert.equal(first.byAssistant.get('a').answer, '答案');
+  for (let i = 0; i < 1000; i++) assert.equal(project(source, entries, { ...record }), first);
+  assert.notEqual(project(other, entries, record), first);
+  const next = project(source, [...entries, user(5, 'u2', '下一个问题')], record);
+  assert.notEqual(next, first);
+  assert.deepEqual(next.pairs, first.pairs);
+  const inherited = project(source, entries, { ...record, boundary: { inheritedMaxSeq: 4 } });
+  assert.deepEqual(inherited.pairs, []);
+  assert.deepEqual(project(source, entries, record).pairs, first.pairs);
 });

@@ -16,7 +16,7 @@
 Web 端执行：
 
 ```powershell
-dsh plugin --profile web add "github:Admilkk/dsh-sidechat#v0.2.2"
+dsh plugin --profile web add "github:Admilkk/dsh-sidechat#v0.2.3"
 ```
 
 桌面端可从 [Releases](https://github.com/Admilkk/dsh-sidechat/releases/latest) 下载 `.tgz`，在插件管理中安装。安装后重启 DSH。

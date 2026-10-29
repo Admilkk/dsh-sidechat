@@ -140,16 +140,65 @@ function Button({ icon, label, children, className = '', ...props }) {
   </button>;
 }
 
-function makeState() {
+/** Admit only the current refresh; local mutations invalidate older responses. */
+export function createSidechatState() {
   const parents = new Map();
   const listeners = new Set();
+  const requests = new Map();
+  const versions = new Map();
+  let disposed = false;
+  const get = id => parents.get(id) ?? EMPTY_STATE;
   const emit = () => { for (const listener of listeners) listener(); };
+  const publish = (id, patch) => { parents.set(id, { ...get(id), ...patch }); emit(); };
   return {
     subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
-    get: id => parents.get(id) ?? EMPTY_STATE,
-    set(id, patch) { parents.set(id, { ...(parents.get(id) ?? EMPTY_STATE), ...patch }); emit(); },
+    get,
+    version: id => versions.get(id) ?? 0,
+    set(id, patch) {
+      if (disposed) return;
+      requests.delete(id);
+      versions.set(id, (versions.get(id) ?? 0) + 1);
+      publish(id, patch);
+    },
+    refresh(id, load, normalize) {
+      if (disposed) return Promise.resolve(EMPTY);
+      if (requests.has(id)) return requests.get(id).promise;
+      const request = {};
+      const current = () => !disposed && requests.get(id) === request;
+      request.promise = Promise.resolve().then(() => current() ? load() : EMPTY).then(value => {
+        if (!current()) return get(id).records;
+        const records = normalize(value);
+        const previous = get(id).selected;
+        const selected = records.some(record => record.id === previous) ? previous : records[0]?.id ?? null;
+        publish(id, { records, selected, loading: false, error: null });
+        return records;
+      }).catch(error => {
+        if (!current()) return get(id).records;
+        publish(id, { loading: false, error: errorText(error) });
+        throw error;
+      }).finally(() => { if (current()) requests.delete(id); });
+      requests.set(id, request);
+      publish(id, { loading: true, error: null });
+      return request.promise;
+    },
     isChild(id) { for (const value of parents.values()) if (value.records.some(record => record.sessionId === id)) return true; return false; },
     recordFor(id) { for (const value of parents.values()) { const found = value.records.find(record => record.sessionId === id); if (found) return found; } return null; },
+    dispose() { disposed = true; requests.clear(); listeners.clear(); parents.clear(); versions.clear(); },
+  };
+}
+
+/** Share one projection across every reply action, retaining only the latest window. */
+export function createTranscriptProjection() {
+  const sources = new WeakMap();
+  return (source, entries, record) => {
+    const boundary = record.boundary?.inheritedMaxSeq;
+    const capturedAt = record.boundary?.capturedAt ?? record.createdAt;
+    const cached = sources.get(source);
+    if (cached?.entries === entries && cached.sessionId === record.sessionId && cached.boundary === boundary && cached.capturedAt === capturedAt) return cached.value;
+    const pairs = collectReturnPairs(completedMessages(entries, record));
+    const value = { pairs, byAssistant: new Map(pairs.map(pair => [pair.assistantMessageId, pair])), inherited: inheritedTurnIds(entries, record) };
+    sources.set(source, { entries, sessionId: record.sessionId, boundary, capturedAt, value });
+    return value;
   };
 }
 
@@ -161,27 +210,31 @@ function localWrite(key, value) { try { localStorage.setItem(`${PLUGIN_ID}.${key
 export const inject = ['slots', 'sessions', 'sidebarRightTabs', 'sidebarRight', 'connection', 'remote', 'uiConversation', 'uiSession', 'inputTriggers', 'commandUi', 'layout'];
 
 export function apply(ctx) {
-  const store = makeState();
+  const store = createSidechatState();
+  const projectTranscript = createTranscriptProjection();
   const releases = [];
   const retained = new Map();
-  const requests = new Map();
-  const hiddenIds = new Set();
+  const opening = new Map();
+  const removedSessions = new Set();
   let disposed = false;
-  let currentParent = null;
   let selectionState = null;
   let selectionListeners = new Set();
   const selectionNotify = value => { selectionState = value; for (const fn of selectionListeners) fn(); };
   const useParent = id => useSyncExternalStore(store.subscribe, () => store.get(id), () => store.get(id));
   const useSelection = () => useSyncExternalStore(fn => { selectionListeners.add(fn); return () => selectionListeners.delete(fn); }, () => selectionState, () => null);
-  const rpc = (method, request, signal) => callSidechat(ctx.connection, method, request, signal);
+  const ensureActive = () => { if (disposed) throw new Error('插件已卸载'); };
+  const rpc = (method, request, signal) => { ensureActive(); return callSidechat(ctx.connection, method, request, signal); };
   ctx.remote.$on('api-session/removed', id => {
+    removedSessions.add(id);
     const record = store.recordFor(id);
     if (record) forgetChild(record);
     if (store.get(id) !== EMPTY_STATE) store.set(id, { parentClosed: true });
   });
   ctx.remote.$on('api-session/added', summary => { if (store.get(summary.sessionId) !== EMPTY_STATE) store.set(summary.sessionId, { parentClosed: false }); });
   const receiveRecord = value => {
+    ensureActive();
     const record = normalizeRecord(value);
+    if (record && removedSessions.has(record.sessionId)) return null;
     // A private side is intentionally absent from the ordinary baseline after reload.
     // Publish its authenticated Host summary before asking the native client to retain it.
     if (record && isTemporarySession(record.sessionId) && value.summary?.sessionId === record.sessionId) ctx.sessions.handleSessionAdded(value.summary);
@@ -195,6 +248,7 @@ export function apply(ctx) {
     return shell;
   };
   const retain = async sessionId => {
+    ensureActive();
     if (retained.has(sessionId)) return retained.get(sessionId).promise;
     const reference = ctx.sessions.retain(sessionId, { source: PLUGIN_ID });
     const holder = { reference, promise: Promise.resolve(reference.ready).then(() => {
@@ -202,7 +256,7 @@ export function apply(ctx) {
       return reference;
     }) };
     retained.set(sessionId, holder);
-    try { return await holder.promise; } catch (error) { retained.delete(sessionId); reference.release(); throw error; }
+    try { return await holder.promise; } catch (error) { if (retained.get(sessionId) === holder) { retained.delete(sessionId); reference.release(); } throw error; }
   };
   const attach = async (sessionId, item) => {
     await retain(sessionId);
@@ -216,46 +270,41 @@ export function apply(ctx) {
     const shell = inputShell(sessionId);
     shell.setDraft(removeContextDraft(shell.draftSnapshot, id));
   };
-  const refresh = parentId => {
-    if (requests.has(parentId)) return requests.get(parentId);
-    store.set(parentId, { loading: true, error: null });
-    const pending = rpc('list', { parentId }).then(value => {
-      if (disposed) return [];
-      const records = (Array.isArray(value) ? value : value.records ?? []).map(receiveRecord).filter(Boolean);
-      const oldSelected = store.get(parentId).selected;
-      const selected = records.some(record => record.id === oldSelected) ? oldSelected : records.find(record => record.status === 'active')?.id ?? records[0]?.id ?? null;
-      for (const record of records) hiddenIds.add(record.sessionId);
-      syncHidden();
-      store.set(parentId, { records, selected, loading: false, error: null });
-      return records;
-    }).catch(error => { if (!disposed) store.set(parentId, { loading: false, error: errorText(error) }); throw error; })
-      .finally(() => requests.delete(parentId));
-    requests.set(parentId, pending);
-    return pending;
-  };
+  const refresh = parentId => store.refresh(parentId, () => rpc('list', { parentId }), value =>
+    (Array.isArray(value) ? value : value.records ?? []).map(receiveRecord).filter(Boolean));
   const updateRecord = (parentId, record) => {
     if (!record) throw new Error('侧聊记录响应无效');
-    hiddenIds.add(record.sessionId); syncHidden();
     const records = store.get(parentId).records.filter(item => item.id !== record.id);
-    store.set(parentId, { records: [record, ...records], selected: record.id, error: null });
+    store.set(parentId, { records: [record, ...records], selected: record.id, loading: false, error: null });
   };
   const openPanel = async (parentId, quote) => {
+    ensureActive();
     if (!parentId) throw new Error('请先打开一个主会话。');
-    currentParent = parentId;
     ctx.sidebarRight.openTab(KIND, { params: { parentId } });
-    const records = await refresh(parentId);
-    let record = records.find(item => item.id === store.get(parentId).selected);
-    if (!record) { record = receiveRecord(await rpc('open', { parentId })); if (!record) throw new Error('侧聊创建响应无效'); updateRecord(parentId, record); }
-    if (quote) await attach(record.sessionId, quote);
+    let pending = opening.get(parentId);
+    if (!pending) {
+      const version = store.version(parentId);
+      pending = (async () => {
+        const records = await refresh(parentId);
+        ensureActive();
+        if (version !== store.version(parentId)) return null;
+        let record = records.find(item => item.id === store.get(parentId).selected);
+        if (!record) { record = receiveRecord(await rpc('open', { parentId })); if (!record) throw new Error('侧聊创建响应无效'); updateRecord(parentId, record); }
+        return record;
+      })().finally(() => { if (opening.get(parentId) === pending) opening.delete(parentId); });
+      opening.set(parentId, pending);
+    }
+    const record = await pending;
+    if (record && quote) await attach(record.sessionId, quote);
     return record;
   };
   const forgetChild = record => {
     const holder = retained.get(record.sessionId);
     if (holder) { holder.reference.release(); retained.delete(record.sessionId); }
     ctx.sessions.handleSessionRemoved(record.sessionId);
-    hiddenIds.delete(record.sessionId); syncHidden();
+    removedSessions.add(record.sessionId);
     if (store.get(record.parentId).records.some(item => item.id === record.id)) {
-      store.set(record.parentId, { records: [], selected: null });
+      store.set(record.parentId, { records: [], selected: null, loading: false });
       const parent = retained.get(record.parentId);
       if (parent) { parent.reference.release(); retained.delete(record.parentId); }
     }
@@ -271,7 +320,8 @@ export function apply(ctx) {
       if (reference.binding.eventSource.getSnapshot().entries[0]?.event?.seq === before) break;
     }
     if (session.getSnapshot().hasMore) throw new Error('部分侧聊历史尚未载入，请向上加载后重试。');
-    return collectReturnPairs(completedMessages(reference.binding.eventSource.getSnapshot().entries, record));
+    const source = reference.binding.eventSource;
+    return projectTranscript(source, source.getSnapshot().entries, record).pairs;
   };
 
   const style = document.createElement('style');
@@ -282,10 +332,7 @@ export function apply(ctx) {
   const hiddenStyle = document.createElement('style');
   hiddenStyle.dataset.codexSidechatHidden = PLUGIN_ID;
   document.head.appendChild(hiddenStyle);
-  function syncHidden() {
-    hiddenStyle.textContent = '[data-row-key^="session:codex-sidechat-temp-"][role="treeitem"]{display:none!important}';
-  }
-  syncHidden();
+  hiddenStyle.textContent = '[data-row-key^="session:codex-sidechat-temp-"][role="treeitem"]{display:none!important}';
   releases.push(() => hiddenStyle.remove());
 
   releases.push(ctx.inputTriggers.registerSource({
@@ -342,7 +389,7 @@ export function apply(ctx) {
   function BoundChild({ reference, record, contextOpen, SessionProvider, renderSlot }) {
     const source = reference.binding.eventSource;
     const events = useSyncExternalStore(listener => source.subscribe(listener), () => source.getSnapshot(), () => source.getSnapshot());
-    const inherited = inheritedTurnIds(events.entries, record);
+    const inherited = projectTranscript(source, events.entries, record).inherited;
     const selector = `.csc-child[data-csc-session="${CSS.escape(record.sessionId)}"][data-csc-hide-inherited="true"]`;
     return <div className="csc-child" data-csc-session={record.sessionId} data-csc-hide-inherited={!contextOpen}>
       <style>{inherited.map(turn => `${selector} [data-chat-turn="${turn}"]{display:none!important}`).join('\n') + (record.boundary?.hiddenMessageId ? `\n.csc-child[data-csc-session="${CSS.escape(record.sessionId)}"] [data-chat-flow-key$="${CSS.escape(record.boundary.hiddenMessageId)}"]{display:none!important}` : '')}</style>
@@ -392,7 +439,7 @@ export function apply(ctx) {
     const [width, setWidth] = useState(() => clampWidth(localRead('width', 440), window.innerWidth));
     const root = useRef(null);
     const lastAction = useRef(null);
-    useEffect(() => { currentParent = parentId; refresh(parentId).catch(() => {}); }, [parentId]);
+    useEffect(() => { refresh(parentId).catch(() => {}); }, [parentId]);
     useEffect(() => {
       const resize = () => setWidth(value => clampWidth(value, window.innerWidth));
       window.addEventListener('resize', resize);
@@ -409,9 +456,15 @@ export function apply(ctx) {
       document.querySelector(`[data-conversation-session="${CSS.escape(parentId)}"] [data-composer-input=true]`)?.focus();
     };
     const discard = () => run(async () => {
-      if (record) {
-        await rpc('discard', { parentId, id: record.id });
-        forgetChild(record);
+      // A close while creation is in flight must also dispose the eventual child.
+      const pending = opening.get(parentId);
+      if (pending) await pending.catch(() => null);
+      const current = store.get(parentId).records[0];
+      if (current) {
+        await rpc('discard', { parentId, id: current.id });
+        forgetChild(current);
+      } else {
+        store.set(parentId, { records: [], selected: null, loading: false });
       }
       returnToMain();
     });
@@ -483,7 +536,7 @@ export function apply(ctx) {
     const record = store.recordFor(sessionId);
     const source = ctx.sessions.binding(sessionId)?.eventSource;
     const events = useSyncExternalStore(listener => source?.subscribe(listener) ?? (() => {}), () => source?.getSnapshot() ?? EMPTY, () => EMPTY);
-    const pair = record ? collectReturnPairs(completedMessages(Array.isArray(events.entries) ? events.entries : [], record)).find(item => item.assistantMessageId === messageId) : null;
+    const pair = record && source ? projectTranscript(source, Array.isArray(events.entries) ? events.entries : EMPTY, record).byAssistant.get(messageId) : null;
     if (!record || !pair) return null;
     return <span className="codex-sidechat csc-return-action"><Button label="将这组问答带回主对话" icon={added ? '✓' : 'back'} disabled={busy} onClick={async () => {
       setBusy(true); setError(null);
@@ -574,6 +627,8 @@ export function apply(ctx) {
   }
   ctx.effect(() => () => {
     disposed = true;
+    store.dispose();
+    removedSessions.clear();
     selectionListeners.clear();
     for (const release of releases.reverse()) { try { if (typeof release === 'function') release(); } catch (error) { console.error(`[${PLUGIN_ID}] cleanup`, error); } }
     for (const { reference } of retained.values()) reference.release();

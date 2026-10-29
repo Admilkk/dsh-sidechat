@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-sidechat",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Codex-style side conversations for DeepSeek Harness.",
   "type": "module",
   "license": "AGPL-3.0-only",
