@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-sidechat",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "displayName": "DSH Sidechat",
   "description": "临时侧聊、任务边界隔离、主线状态提醒与结果回传。",
   "engines": {

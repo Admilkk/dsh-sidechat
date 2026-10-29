@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-for (const file of ['lib/index.js', 'lib/query-view.js', 'lib/client.js', 'cordis.patch.yml', 'dsh.plugin.json', 'README.md', 'LICENSE']) {
+for (const file of ['lib/index.js', 'lib/persistence.js', 'lib/query-view.js', 'lib/client.js', 'cordis.patch.yml', 'dsh.plugin.json', 'README.md', 'LICENSE']) {
   if (!(await stat(path.join(root, file))).isFile()) throw new Error(`Missing package file: ${file}`);
 }
 const manifest = JSON.parse(await readFile(path.join(root, 'dsh.plugin.json'), 'utf8'));

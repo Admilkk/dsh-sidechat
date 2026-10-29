@@ -19,6 +19,7 @@ const common = {
   external: ['@deepseek-ai/*', 'zod', 'cordis', 'react', 'react/*', 'react-dom', 'react-dom/*'],
 };
 await build({ ...common, entryPoints: ['src/index.mjs'], outfile: 'lib/index.js', format: 'esm', platform: 'node' });
+await build({ ...common, entryPoints: ['src/persistence.mjs'], outfile: 'lib/persistence.js', format: 'esm', platform: 'node' });
 await build({ ...common, entryPoints: ['src/query-view.mjs'], outfile: 'lib/query-view.js', format: 'esm', platform: 'node' });
 await build({
   ...common,

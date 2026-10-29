@@ -13,13 +13,13 @@
 
 适配 **DSH 0.2.1-rc.3**。
 
-从 [Releases](https://github.com/Admilkk/dsh-sidechat/releases/latest) 下载 `.tgz`，在 DSH 插件管理中安装，然后重启应用。
-
-Web 端也可通过命令安装本地包：
+Web 端执行：
 
 ```powershell
-dsh plugin --profile web add ./dsh-codex-sidechat-0.2.1.tgz
+dsh plugin --profile web add "github:Admilkk/dsh-sidechat#v0.2.2"
 ```
+
+桌面端可从 [Releases](https://github.com/Admilkk/dsh-sidechat/releases/latest) 下载 `.tgz`，在插件管理中安装。安装后重启 DSH。
 
 ## 使用
 

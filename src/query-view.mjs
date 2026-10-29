@@ -1,4 +1,5 @@
-import { Context, Service } from '@deepseek-ai/cordis';
+import { Service } from '@deepseek-ai/cordis';
+import { SqliteSessionQueryEngine } from '@deepseek-ai/dsh-session-query-sqlite';
 import { isTemporarySession } from './policy.mjs';
 
 /** Query-only store view: enumerate ordinary sessions; exact side reads still work. */
@@ -10,12 +11,12 @@ export class QuerySessions extends Service {
   get messageProjections() { return this.backend.api.messageProjections; }
 }
 
-export const name = 'codex-sidechat-query-view';
-export const inject = [];
-export function apply(ctx) {
-  const label = ctx[Context.isolate].sessions;
-  ctx.isolate('sessions', ctx.root[Context.isolate].sessions).inject(['sessions'], nativeCtx => {
-    const sessions = nativeCtx.sessions;
-    nativeCtx.isolate('sessions', label).plugin({ name, apply: viewCtx => { new QuerySessions(viewCtx, sessions); } });
-  });
+export const name = 'session-query-sqlite';
+export const Config = SqliteSessionQueryEngine.Config;
+export const inject = ['sessions'];
+export async function apply(ctx, config) {
+  const sessions = ctx.sessions;
+  const queryCtx = ctx.isolate('sessions');
+  await queryCtx.plugin({ name: 'codex-sidechat-query-sessions', apply(viewCtx) { new QuerySessions(viewCtx, sessions); } }).await();
+  await queryCtx.plugin(SqliteSessionQueryEngine, config).await();
 }

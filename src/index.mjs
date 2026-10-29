@@ -1,15 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { Context } from '@deepseek-ai/cordis';
 import { buildForkSeed } from '@deepseek-ai/dsh-session';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import { SidechatServiceCore, PluginError } from './service.mjs';
-import { TemporaryLogs, SidechatPersistence } from './memory-persistence.mjs';
+import { TemporaryLogs } from './memory-persistence.mjs';
 import { SIDE_POLICY, SIDE_BOUNDARY, TEMP_PREFIX, forbiddenSideTool, isTemporarySession } from './policy.mjs';
 
 export const name = 'codex-sidechat';
-export const inject = ['sessionPersistence'];
 const HOST_INJECT = ['sessionController', 'sessionQuery', 'typert', 'agents', 'sessions', 'systemPrompt', 'tools', 'sessionPersistence', 'agentDefaultModel'];
+export const inject = HOST_INJECT;
 
 export function forkBoundary(events, atSeq) {
   const boundary = atSeq ?? events.at(-1)?.seq;
@@ -123,9 +122,7 @@ for (const method of ['list', 'open', 'discard', 'update', 'save']) {
 }
 
 export function apply(ctx) {
-  const publicCtx = ctx.isolate('sessionPersistence', ctx.root[Context.isolate].sessionPersistence);
-  const temporary = new TemporaryLogs();
-  const durable = ctx.sessionPersistence;
-  publicCtx.plugin({ name: 'codex-sidechat-persistence', apply: routerCtx => { new SidechatPersistence(routerCtx, durable, temporary); } });
-  publicCtx.inject(HOST_INJECT, readyCtx => { new CodexSidechatHost(readyCtx, temporary); });
+  const temporary = ctx.sessionPersistence.temporary;
+  if (!temporary) throw new Error('DSH Sidechat requires its bundled persistence adapter.');
+  new CodexSidechatHost(ctx, temporary);
 }
