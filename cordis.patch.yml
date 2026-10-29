@@ -1,0 +1,15 @@
+- id: session-persistence-jsonl
+  isolate:
+    sessionPersistence: codex-sidechat-durable
+- id: session-query-sqlite
+  isolate:
+    sessions: codex-sidechat-query-sessions
+- insert:
+    - id: codex-sidechat-query-view
+      name: dsh-codex-sidechat/query-view
+      isolate:
+        sessions: codex-sidechat-query-sessions
+    - id: codex-sidechat
+      name: dsh-codex-sidechat
+      isolate:
+        sessionPersistence: codex-sidechat-durable
